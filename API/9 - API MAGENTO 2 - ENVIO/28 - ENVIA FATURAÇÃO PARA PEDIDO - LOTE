@@ -1,0 +1,282 @@
+<?php
+
+/*-------------------------------------------------------*/
+/*                    PROCESSO 28                        */
+/*-------------------------------------------------------*/
+
+namespace hardness;
+
+global $g, $url, $token, $confUsuario;
+
+// Incluir a API da Intelipost, usado para criarPedido caso a tranportadora seja TOTAL EXPRESS
+include ("bibliotecas/webservices/intelipost/apiIntelipost.php");
+$Intelipost = new Intelipost();
+
+// Confirma status do pedido e recebe entity_id para enviar para API. $r_T005_Id_Pedido_Externo vem do ajax do Vendas-> Expedição de Mercadorias -> Aguardando Coleta coluna Envio Magento
+//$orders = $API001->executaProcesso(25, array('status' => $r_status));
+
+//Executa processo 24(ATUALIZAR TOKEN)
+$token = $API001->executaProcesso(24);
+
+/*ajax envia a clausula where do grid 
+para selecionar os pedidos baseados no filtro*/
+$rawWhere = base64_decode($r_sql);
+
+// Se caso o Ajax mandar que é a primeira execução
+if($r_inicio == 1)
+{
+    // Faz uma query para contar quantos pedidos foram selecionados
+    // Insira clausula where aqui!
+    $where = $rawWhere . "AND (T007_Flag_Imprimir_Romaneio = 'S' AND T005_Data_Hora_Envio_Ecommerce = '0000-00-00 00:00:00')";
+    $T005 = mysql_query("SELECT COUNT(*) AS CONTAGEM 
+                         FROM T005 
+                         LEFT JOIN T007 ON T007_T005_Id = T005_Id
+                         LEFT JOIN D022 ON T005_D022_Id = D022_Id
+                         LEFT JOIN D024 ON T005_D024_Id = D024_Id 
+                         WHERE" . $where);
+    if($erro = mysql_error()){log("Erro SQL da faturação->$erro");}
+    $mT005 = mysql_fetch_assoc($T005);
+
+    // Monta a resposta de quantas etapas são para enviar ao Ajax
+    // Insira clausula where aqui!
+    $resposta['maxEtapas'] = $mT005['CONTAGEM'];
+    $resposta['concluido'] = 0;
+
+    // Seleciona os pedidos que já foram importados para informar ao usuário quais serão ignorados
+    $where = $rawWhere . "AND (T007_Flag_Imprimir_Romaneio = 'S' AND T005_Data_Hora_Envio_Ecommerce != '0000-00-00 00:00:00')";
+    $T005 = mysql_query("SELECT T005_Id_Pedido_Externo
+                         FROM T005 
+                         LEFT JOIN T007 ON T007_T005_Id = T005_Id
+                         LEFT JOIN D022 ON T005_D022_Id = D022_Id
+                         LEFT JOIN D024 ON T005_D024_Id = D024_Id                         
+                         WHERE" . $where);
+    if($erro = mysql_error()){log("Erro SQL da faturação->$erro");}
+
+    $enviadosAntes = array();
+    while($mT005 = mysql_fetch_assoc($T005))
+    {
+        array_push($enviadosAntes, $mT005['T005_Id_Pedido_Externo']);
+    }
+
+    $enviadosAntes = implode(",", $enviadosAntes);
+    $resposta['enviadosAntes'] = (empty($enviadosAntes) ? '' : "Notas já enviadas: <b>" . $enviadosAntes . "</b>");
+
+    // Envia resposta ao ajax
+    echo json_encode($resposta);
+    return;
+}
+else
+{
+    /* Query que seleciona um pedido por vez 
+    insira clausula WHERE aqui!!!*/
+    $where = $rawWhere . "AND (T007_Flag_Imprimir_Romaneio = 'S' AND T005_Data_Hora_Envio_Ecommerce = '0000-00-00 00:00:00')";
+    $T007 = mysql_query("SELECT 
+                         T005_Id,
+                         T005_Id_Pedido_Externo,
+                         T005_Pedido_Ecommerce, 
+                         T005A_JSON->>'$.id_anymarket' AS idPedidoAnyMarket,
+                         T005_Canal_Vendas_Ecommerce,
+                         T007_Chave_Acesso_Nfe AS CHAVE_ACESSO_NOTA,
+                         T007_Id,
+                         T007_D024_Id,
+                         CONCAT((DATE_FORMAT(T007_Data_Emissao,'%d/%m/%Y')),' ',T007_Hora_Emissao) AS DATA_HORA_EMISSAO,
+                         T007_Numero_Nota_Fiscal,
+                         D022_Nome_Empresa
+                         FROM T005
+                         LEFT JOIN T005A ON T005A_T005_Id = T005_Id 
+                         LEFT JOIN T007 ON T007_T005_Id = T005_Id
+                         LEFT JOIN D022 ON T007_D022_Id = D022_Id
+                         LEFT JOIN D024 ON T005_D024_Id = D024_Id                         
+                         WHERE" . $where . " LIMIT 1");
+    if($erro = mysql_error()){log("Erro SQL da faturação->$erro");}                         
+    $mT007 = mysql_fetch_assoc($T007);
+
+    if(!empty($mT007))
+    {
+        if(empty($mT007['CHAVE_ACESSO_NOTA']) || empty($mT007['DATA_HORA_EMISSAO']) || empty($mT007['T007_D024_Id']) || empty($mT007['T007_Id']))
+        {
+            $resposta['erro'] = "<b>{$mT007['T005_Id']}: Falta informações de nota fiscal!</b>";
+
+            echo json_encode($resposta);
+            return;
+        }
+
+        if(empty($mT007['T005_Pedido_Ecommerce']))
+        {
+            $resposta['erro'] = "<b>{$mT007['T005_Id']}: Pedido não tem o 'entity_id' definido!</b>";
+
+            echo json_encode($resposta);
+            return;
+        }
+
+        //INICIO --- CODIGO ENVIO DE NOTA AQUI
+
+            // Monta oque vai no comentário da nota fiscal
+            $Query = md5($mT007['T007_D024_Id'].'|'.$mT007['T007_Id']);
+            $mT007['LINK_DANFE'] = "{$confUsuario['urlRaiz']}hardness3/hardness/danfe/imprimir_danfe.php?Query={$Query}&vlrNF=S&T007_Id={$mT007['T007_Id']}";
+
+            $comentario = "";
+            $comentario .= "nfe:" . $mT007['CHAVE_ACESSO_NOTA'] . ";";
+            $comentario .= "emissao:" . gCorrigeData($mT007['DATA_HORA_EMISSAO']) . ";";
+            $comentario .= "LINK:" . $mT007['LINK_DANFE'] . ";";
+
+            $jsonEnviarArray = array();
+            $jsonEnviarArray['statusHistory'] = array(
+            "comment" =>  $comentario,                                      // "comment" => comentário a ser inserido no magento 2(obrigatorio)
+            // Mudar status dps para faturado
+            "status" => "faturado",                                         // "status" => atualiza status do pedido(não é obrigatório mas é bom colocar pois se não pode desorganizar pedidos no magento 2)
+            "is_visible_on_front" => 0,                                     // "is_visible_on_front" => ?????
+            "is_customer_notified" => 0,                                    // "is_customer_notified" => se o cliente deve ser notificado do comentário adicionado no magento 2(não obrigatório mas bom colocar 0 caso for fazer testes)
+            //"created_at" => "valorAqui",                                  // "created_at" => data a ser inserida no comentário do magento 2(não obrigatorio)
+            //"entity_id" => "valorAqui",                                   // "entity_id" => caso você queira modificar um comentário você pode colocar o entity_id do comentário(não obrigatório)
+            //"entity_name" => "valorAqui",                                 // "entity_name" => nome da entidade id(não obrigatório)
+            //"parent_id" => "valorAqui",                                   // "parent_id" => id do parente que recebe o comentário nesse caso é o pedido(não obrigatório pq o parent id é inserido na url)
+            //"extension_attributes" => array()                             // "extension_attributes" => ?
+            );
+
+            $jsonEnviar = json_encode($jsonEnviarArray);
+            $urlDestino = $url . "orders/{$mT007['T005_Pedido_Ecommerce']}/comments";
+
+            // INICIO - ENVIAR PARA API
+
+                $curl = curl_init();
+
+                curl_setopt_array($curl, array(
+                CURLOPT_URL => $urlDestino,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_ENCODING => '',
+                CURLOPT_MAXREDIRS => 10,
+                CURLOPT_TIMEOUT => 0,
+                CURLOPT_FOLLOWLOCATION => true,
+                CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+                CURLOPT_CUSTOMREQUEST => 'POST',
+                CURLOPT_POSTFIELDS => $jsonEnviar,
+                CURLOPT_HTTPHEADER => array(
+                    'Authorization: Bearer ' . $token,
+                    'Content-Type: application/json'
+                ),
+                ));
+
+                $response = curl_exec($curl);
+                curl_close($curl);
+
+                $response = json_decode($response, true);
+
+        // FIM - ENVIAR PARA API
+
+        if(empty($response['message']))
+        {
+            mysql_query("UPDATE T005 LEFT JOIN T007 ON T007_T005_Id = T005_Id
+                        SET T005_Data_Hora_Envio_Ecommerce = CURRENT_TIMESTAMP,
+                        T007_Flag_Imprimir_Romaneio = 'N'
+                        WHERE T005_Id = {$mT007['T005_Id']}");
+
+            // log("Painel PEDIDO {$mT007['T005_Id']}: <a href=\"https://devm2.guimepa.com.br/mguadm/sales/order/view/order_id/{$mT007['T005_Pedido_Ecommerce']}/\" target=\"_blank\">Ver painel</a>");
+
+            // Regra especificada em solitação ao card: https://trello.com/c/qVtJTXDp
+            $transportadora = strtoupper(gLimpaAcentosPuro(trim($mT007['D022_Nome_Empresa'])));
+            
+            if ($transportadora == "TOTAL EXPRESS") 
+            {
+                $retorno = $Intelipost -> criarPedido($mT007['T005_Id']);
+                // Erro na API da Intelipost 
+                if ($retorno[0] == "ERROR") 
+                { 
+                    $resposta['erro'] = "<b>{$mT007['T005_Id']}:</b> " . $retorno[1];
+                    echo json_encode($resposta);
+                    return;  
+                }
+            }            
+
+            // Regra especifica em solicitação do card: https://trello.com/c/Nqbi4ID5
+            $canalVendas = strtoupper(gLimpaAcentosPuro(trim($mT007['T005_Canal_Vendas_Ecommerce'])));
+            
+            log('Canal de vendas -> ' . $canalVendas);
+            log('Transportadora -> ' . $transportadora);
+
+            $listaCanaisVenda_1 = array('MAGAZINE_LUIZA-GUIMEPA', 'MAGAZINE_LUIZA-DELTATOP', 'MAGAZINE_LUIZA-GMK8');
+            $listaCanaisVenda_2 = array('AMAZON-GUIMEPA', 'AMAZON-DELTATOP', 'AMAZON-GMK8');
+            $listaCanaisVenda_3 = array('MERCADO_LIVRE-GUIMEPA', 'MERCADO_LIVRE-GUIMEPA SC');
+            $listaCanaisVenda_4 = array('OLIST_NEW_API-GUIMEPA');
+
+            if (
+                (in_array($canalVendas, $listaCanaisVenda_1)) OR 
+                (in_array($canalVendas, $listaCanaisVenda_2) AND $transportadora == 'DELIVERY BY AMAZON DBA') OR 
+                (in_array($canalVendas, $listaCanaisVenda_3) AND $transportadora == 'MERCADO ENVIOS') OR
+                (in_array($canalVendas, $listaCanaisVenda_4))
+               ) 
+            {
+                // Seleciona dados da nota de venda vinculada ao pedido atual para encontrar o arquivo
+                $T007_2 = "SELECT T007_Data_Emissao, T007_Numero_Protocolo_Nfe FROM T007 WHERE T007_Id = '{$mT007['T007_Id']}'";     
+                log('Query T007_2 -> ' . $T007_2);
+                $mT007_2 = mysql_query($T007_2);
+                $linhaT007_2 = mysql_fetch_assoc($mT007_2);
+
+                $anoMesNFe = substr($linhaT007_2['T007_Data_Emissao'], 0, 7);
+                $dirNFe = $g['pathDadosAntigo'] . 'nfe';
+                $dirArqv = "{$dirNFe}/xml/autorizado/{$anoMesNFe}/{$linhaT007_2['T007_Numero_Protocolo_Nfe']}.xml";
+                log('Diretório do arquivo -> ' . $dirArqv);
+                $strArqv = file_get_contents($dirArqv);
+                log('Conteúdo do arquivo XML: ' . $strArqv);
+
+                $tokenAnyMarket = "259029869L1E1668256201567C157494420156700O1.I";
+                $idPedidoAnyMarket = $mT007['idPedidoAnyMarket'];
+                log('Id AnyMarket -> ' . $idPedidoAnyMarket);
+
+                // Envia o arquivo para a AnyMarket repassar para o marketplace
+                log("http://api.anymarket.com.br/v2/orders/{$idPedidoAnyMarket}/nfe");
+
+                $curl = curl_init();
+                curl_setopt_array($curl, [
+                    CURLOPT_URL => "http://api.anymarket.com.br/v2/orders/{$idPedidoAnyMarket}/nfe",
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_ENCODING => "",
+                    CURLOPT_MAXREDIRS => 10,
+                    CURLOPT_TIMEOUT => 30,
+                    CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+                    CURLOPT_CUSTOMREQUEST => "PUT",
+                    CURLOPT_POSTFIELDS => "{$strArqv}",
+                    CURLOPT_HTTPHEADER => [
+                        "Content-Type: application/xml",
+                        "gumgaToken: {$tokenAnyMarket}"
+                    ],
+                ]);
+                $rawResponseAnyMarket = curl_exec($curl);    
+                $responseAnyMarket = json_decode($rawResponseAnyMarket, true);
+                curl_close($curl);
+
+                // Verifica se foi retornado algum erro
+                if (!empty($responseAnyMarket['message']))
+                {
+                    log('Erro no envio da nota venda ao AnyMarket <pre>' . print_r($responseAnyMarket, true) . '</pre>');   
+                    $resposta['erro'] = "<b>{$mT007['T005_Id']}: Erro de API da AnyMarket! Verifique o log.</b>";                     
+                    echo json_encode($resposta);
+                    return;
+                }
+            }
+        }
+        else
+        {
+            $resposta['erro'] = "<b>{$mT007['T005_Id']}: Erro de API do Magento! Verifique o log.</b>";
+
+            log("Erro na API Magento 2" . var_export($response, true));
+
+            echo json_encode($resposta);
+            return;
+        }
+
+        //FIM ---CODIGO ENVIO DE NOTA AQUI
+
+        $resposta['concluido'] = 0;
+
+        echo json_encode($resposta);
+        return;
+    }
+    else
+    {
+        $resposta['concluido'] = 1;
+
+        echo json_encode($resposta);
+        return;
+    }
+}
